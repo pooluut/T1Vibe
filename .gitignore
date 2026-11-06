@@ -1,0 +1,18 @@
+/build/
+/dist/
+/tools/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.zip
+*.log
+*.bak
+*.tmp
+.vs/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Legacy local experiments (not part of the source project)
+/RemoteBridge/

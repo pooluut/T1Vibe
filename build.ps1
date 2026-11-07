@@ -1,4 +1,4 @@
-param([string]$Zig = '', [switch]$Test, [string]$OutputDirectory = '')
+﻿param([string]$Zig = '', [switch]$Test, [string]$OutputDirectory = '')
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($Zig)) {
@@ -59,12 +59,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Native hook build failed.' }
 $exe = Join-Path $dist 'T1Vibe.exe'
 & $csc /nologo /platform:x64 /optimize+ /target:winexe "/out:$exe" "/resource:$hook,T1Vibe.HomeHook" $refs $source
 if ($LASTEXITCODE -ne 0) { throw 'Application build failed. Exit T1Vibe before rebuilding.' }
-$relayExe = Join-Path $dist 'T1VibeVoiceRelay.exe'
-& $csc /nologo /platform:x64 /optimize+ /target:winexe /define:VOICE_RELAY "/out:$relayExe" "/resource:$hook,T1Vibe.HomeHook" $refs $source
-if ($LASTEXITCODE -ne 0) { throw 'Voice relay build failed. Exit T1VibeVoiceRelay before rebuilding.' }
-$receiverExe = Join-Path $dist 'T1VibeUU.exe'
-& $csc /nologo /platform:x64 /optimize+ /target:winexe /define:UU_RECEIVER "/out:$receiverExe" "/resource:$hook,T1Vibe.HomeHook" $refs $source
-if ($LASTEXITCODE -ne 0) { throw 'UU receiver build failed. Exit T1VibeUU before rebuilding.' }
 if ($Test) {
     foreach ($name in @('HookTests','ProjectLabelTests','VoiceTests')) {
         $testExe = Join-Path $build "$name.exe"
@@ -73,13 +67,11 @@ if ($Test) {
         & $testExe
         if ($LASTEXITCODE -ne 0) { throw "$name failed." }
     }
-    foreach ($package in @($exe,$relayExe,$receiverExe)) {
+    foreach ($package in @($exe)) {
         $check = Start-Process -FilePath $package -ArgumentList '--check-package' -WindowStyle Hidden -Wait -PassThru
         if ($check.ExitCode -ne 0) { throw "Embedded hook check failed for $package`: $($check.ExitCode)" }
     }
     Write-Output 'PASS: embedded hook loads, registers and unloads.'
 }
 Write-Output "Built: $exe"
-Write-Output "Built: $relayExe"
-Write-Output "Built: $receiverExe"
 

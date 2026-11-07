@@ -7,8 +7,12 @@ using System.Windows.Automation;
 using System.Windows.Forms;
 class Bridge : Form
 {
-    internal enum RunMode { Local, VoiceRelay, UUReceiver }
+    internal enum RunMode { Local, VoiceRelay, UUReceiver, DirectVoiceExperiment }
     readonly RunMode mode;
+    readonly NavigationKeys navigationKeys = new NavigationKeys();
+    AutomationElement conversationFocus;
+    static bool IsChatForeground() { return string.Equals(ForegroundProcessName(), "ChatGPT", StringComparison.OrdinalIgnoreCase); }
+    static IntPtr FindForegroundChat() { return IsChatForeground() ? GetForegroundWindow() : IntPtr.Zero; }
     readonly RemoteVoiceKey remoteVoiceKey = new RemoteVoiceKey();
     readonly RelayPulse relayPulse = new RelayPulse();
     System.Windows.Forms.Timer relayTimer;
@@ -25,7 +29,7 @@ class Bridge : Form
         catch (UnauthorizedAccessException) { }
     }
     readonly Dictionary<IntPtr, ConsumerDevice> consumerDevices = new Dictionary<IntPtr, ConsumerDevice>();
-    NotifyIcon tray; DateTime last = DateTime.MinValue; bool opening; IntPtr keyboardHook; HookProc hookProc; bool enterDown; bool appsDown; bool homeDown; EventWaitHandle homeSignal; System.Windows.Forms.Timer homeTimer; uint shellMessage; uint nativeHomeMessage; IntPtr nativeModule, nativeHook; DateTime lastHome = DateTime.MinValue; volatile bool conversationMode; IntPtr conversationWindow; AutomationElement conversationScroller; bool backDown; DateTime lastConversation = DateTime.MinValue; DateTime lastBack = DateTime.MinValue; readonly object conversationLock = new object(); volatile bool sidebarMode; IntPtr sidebarWindow; int sidebarIndex = -1; int[] lastOpenedSidebarId; readonly object sidebarLock = new object();
+    NotifyIcon tray; DateTime last = DateTime.MinValue; bool opening; IntPtr keyboardHook; HookProc hookProc; EventWaitHandle homeSignal; System.Windows.Forms.Timer homeTimer; uint shellMessage; uint nativeHomeMessage; IntPtr nativeModule, nativeHook; DateTime lastHome = DateTime.MinValue; volatile bool conversationMode; IntPtr conversationWindow; AutomationElement conversationScroller; DateTime lastConversation = DateTime.MinValue; DateTime lastBack = DateTime.MinValue; readonly object conversationLock = new object(); volatile bool sidebarMode; IntPtr sidebarWindow; int sidebarIndex = -1; int[] lastOpenedSidebarId; readonly object sidebarLock = new object();
     [STAThread] static void Main(string[] args)
     {
         if (args.Length > 0 && args[0] == "--check-package") { Environment.Exit(CheckPackage()); return; }
@@ -41,7 +45,8 @@ class Bridge : Form
 #elif UU_RECEIVER
         selected = RunMode.UUReceiver;
 #endif
-        if (Array.IndexOf(args, "--voice-relay") >= 0) selected = RunMode.VoiceRelay;
+        if (Array.IndexOf(args, "--voice-direct-experiment") >= 0) selected = RunMode.DirectVoiceExperiment;
+        else if (Array.IndexOf(args, "--voice-relay") >= 0) selected = RunMode.VoiceRelay;
         else if (Array.IndexOf(args, "--uu-receiver") >= 0) selected = RunMode.UUReceiver;
         bool created;
         using (var mutex = new Mutex(true, "T1Vibe.RemoteBridge", out created))
@@ -55,9 +60,19 @@ class Bridge : Form
     Bridge(RunMode selected)
     {
         mode = selected;
-        Text = mode == RunMode.VoiceRelay ? "T1Vibe：UU 语音转发端" : "T1 语音快捷键";
+        Text = mode == RunMode.DirectVoiceExperiment ? "T1Vibe：直接 Win+H 实验" : mode == RunMode.VoiceRelay ? "T1Vibe：UU 语音转发端" : "T1 语音快捷键";
         var menu = new ContextMenuStrip();
-        if (mode == RunMode.VoiceRelay)
+        if (mode == RunMode.DirectVoiceExperiment)
+        {
+            menu.Items.Add("查看实验状态", null, delegate { Show(); WindowState = FormWindowState.Normal; Activate(); });
+            ClientSize = new System.Drawing.Size(640, 240);
+            Font = new System.Drawing.Font("Microsoft YaHei UI", 10);
+            var instructions = new Label { Dock = DockStyle.Top, Height = 140, Padding = new Padding(16), Text = "实验模式：语音键直接发送 Win+H，不发送 F9，不改变输入焦点。\r\n两端均可运行本模式。操作端将 UU 远程画面置于前台后按语音键。\r\n观察听写面板出现在本机还是远端；本机计数仅表示提交结果。\r\n本模式不接管返回、App、Home、方向或 OK 键，可最小化到托盘。" };
+            relayStatus = new Label { Dock = DockStyle.Fill, Padding = new Padding(16), Text = "尚未发送 Win+H。" };
+            Controls.Add(relayStatus); Controls.Add(instructions);
+            Resize += delegate { if (WindowState == FormWindowState.Minimized) Hide(); };
+        }
+        else if (mode == RunMode.VoiceRelay)
         {
             menu.Items.Add("查看转发状态", null, delegate { Show(); WindowState = FormWindowState.Normal; Activate(); });
             ConfigureRelayWindow();
@@ -68,14 +83,14 @@ class Bridge : Form
             menu.Items.Add(mode == RunMode.UUReceiver ? "UU 接收：ChatGPT 前台 F9 → Win + H" : "语音键 → Win + H").Enabled = false;
             menu.Items.Add("应用图标键 → 对话浏览；上下滚动").Enabled = false;
             menu.Items.Add("主页键 → 左侧导航；上下选择，确认打开").Enabled = false;
-            menu.Items.Add("返回键 → 打开 ChatGPT 并聚焦输入框").Enabled = false;
+            menu.Items.Add("返回键 → ChatGPT 前台聚焦输入框").Enabled = false;
         }
         menu.Items.Add("退出", null, delegate { Close(); });
-        tray = new NotifyIcon { Icon = System.Drawing.SystemIcons.Application, Text = mode == RunMode.VoiceRelay ? "T1：UU 语音转发端" : mode == RunMode.UUReceiver ? "T1：UU 语音接收 / F9 听写" : "T1：语音听写 / 返回键打开 ChatGPT", ContextMenuStrip = menu, Visible = true };
-        if (mode == RunMode.VoiceRelay) tray.DoubleClick += delegate { Show(); WindowState = FormWindowState.Normal; Activate(); };
+        tray = new NotifyIcon { Icon = System.Drawing.SystemIcons.Application, Text = mode == RunMode.DirectVoiceExperiment ? "T1：直接 Win+H 实验" : mode == RunMode.VoiceRelay ? "T1：UU 语音转发端" : mode == RunMode.UUReceiver ? "T1：UU 语音接收 / F9 听写" : "T1：全局听写 / ChatGPT 导航", ContextMenuStrip = menu, Visible = true };
+        if (mode == RunMode.VoiceRelay || mode == RunMode.DirectVoiceExperiment) tray.DoubleClick += delegate { Show(); WindowState = FormWindowState.Normal; Activate(); };
         Shown += delegate
         {
-            if (mode != RunMode.VoiceRelay) { Hide(); StartAppHooks(); }
+            if (mode != RunMode.VoiceRelay && mode != RunMode.DirectVoiceExperiment) { Hide(); StartAppHooks(); }
             RegisterConsumerInput();
         };
         FormClosed += delegate
@@ -98,7 +113,7 @@ class Bridge : Form
         if (nativeHook == IntPtr.Zero) MessageBox.Show("原生主页拦截模块未能加载，请退出后重试。");
         homeSignal = new EventWaitHandle(false, EventResetMode.AutoReset, "T1Vibe.Home");
         homeTimer = new System.Windows.Forms.Timer { Interval = 100 };
-        homeTimer.Tick += delegate { if (homeSignal.WaitOne(0)) HomePressed(); }; homeTimer.Start();
+        homeTimer.Tick += delegate { if (!IsChatForeground()) { conversationMode = false; sidebarMode = false; conversationFocus = null; } if (homeSignal.WaitOne(0)) HomePressed(); }; homeTimer.Start();
         shellMessage = RegisterWindowMessage("SHELLHOOK"); if (!RegisterShellHookWindow(Handle)) Notice("Shell 主页命令接管注册失败：" + Marshal.GetLastWin32Error());
         hookProc = OnKeyboard; keyboardHook = SetWindowsHookEx(13, hookProc, GetModuleHandle(null), 0);
         if (keyboardHook == IntPtr.Zero) { MessageBox.Show("按键拦截启动失败：" + Marshal.GetLastWin32Error()); Close(); }
@@ -225,18 +240,47 @@ class Bridge : Form
                     return new IntPtr(1);
                 }
             }
-            bool trigger; uint vk = (uint)Marshal.ReadInt32(data); int msg = message.ToInt32(); bool injected = (Marshal.ReadInt32(data, 8) & 0x10) != 0; if (!injected && (msg == 0x100 || msg == 0x104)) VoiceTrace("KEY vk=0x" + vk.ToString("X2")); if (!injected && vk == 0xa6) { if (msg == 0x100 || msg == 0x104) backDown = true; else if (msg == 0x101 || msg == 0x105) { if (backDown) { backDown = false; BeginInvoke(new Action(BackPressed)); } } return new IntPtr(1); }
-            if (!injected && conversationMode && (vk == 0x26 || vk == 0x28)) { if (GetForegroundWindow() == conversationWindow) { if (msg == 0x100) { int direction = vk == 0x26 ? -1 : 1; BeginInvoke(new Action(delegate { ScrollConversation(direction); })); } return new IntPtr(1); } conversationMode = false; }
-            if (!injected && vk == 0xac) { if (msg == 0x100 || msg == 0x104) homeDown = true; else if (msg == 0x101 || msg == 0x105) { if (homeDown) { homeDown = false; BeginInvoke(new Action(HomePressed)); } } return new IntPtr(1); }
-            if (!injected && vk == 0x0d && !sidebarMode) { if (msg == 0x101 || msg == 0x105) { if (enterDown) { enterDown = false; return new IntPtr(1); } } else if (msg == 0x100 || msg == 0x104) { IntPtr chat = FindChat(); if (chat != IntPtr.Zero && GetForegroundWindow() == chat) { if (!enterDown) { enterDown = true; BeginInvoke(new Action(delegate { ProjectEnter(chat); })); } return new IntPtr(1); } } }
-            if (!injected && sidebarMode && (vk == 0x26 || vk == 0x28 || vk == 0x0d)) { if (GetForegroundWindow() == sidebarWindow) { if (msg == 0x100) { int move = vk == 0x26 ? -1 : vk == 0x28 ? 1 : 0; BeginInvoke(new Action(delegate { NavigateSidebar(move, move == 0); })); } return new IntPtr(1); } sidebarMode = false; }
-            if (FilterApps(vk, message.ToInt32(), ref appsDown, out trigger))
+            uint vk = (uint)Marshal.ReadInt32(data); int msg = message.ToInt32();
+            // Ignore only our own replay. UU input may carry LLKHF_INJECTED.
+            if (Marshal.ReadIntPtr(data, 16) == new IntPtr(0x54315642))
+                return CallNextHookEx(keyboardHook, code, message, data);
+            bool chatForeground = IsChatForeground();
+            if (!chatForeground) { conversationMode = false; sidebarMode = false; }
+            bool dispatch;
+            if (navigationKeys.Filter(vk, msg, chatForeground, out dispatch))
             {
-                if (trigger && !IsDisposed) BeginInvoke(new Action(ConversationPressed));
+                if (dispatch)
+                {
+                    IntPtr window = GetForegroundWindow();
+                    BeginInvoke(new Action(delegate
+                    {
+                        if (GetForegroundWindow() != window || !IsChatForeground()) return;
+                        if (vk == 0xa6) BackPressed();
+                        else if (vk == 0xac) HomePressed();
+                        else if (vk == 0x5d) ConversationPressed();
+                        else NavigateActualFocus(window, vk);
+                    }));
+                }
                 return new IntPtr(1);
             }
         }
         return CallNextHookEx(keyboardHook, code, message, data);
+    }
+    internal sealed class NavigationKeys
+    {
+        readonly HashSet<uint> held = new HashSet<uint>();
+        internal bool Filter(uint key, int message, bool chat, out bool dispatch)
+        {
+            dispatch = false;
+            if (message == 0x101 || message == 0x105) return held.Remove(key);
+            if (message != 0x100 && message != 0x104) return false;
+            bool claimed = held.Contains(key);
+            bool supported = key == 0xa6 || key == 0xac || key == 0x5d || key == 0x26 || key == 0x28 || key == 0x0d;
+            if (!claimed && !(chat && supported)) return false;
+            bool first = held.Add(key);
+            dispatch = chat && (first || key == 0x26 || key == 0x28);
+            return true;
+        }
     }
     internal static bool FilterApps(uint vk, int message, ref bool down, out bool trigger)
     {
@@ -270,8 +314,25 @@ class Bridge : Form
     [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr message, IntPtr data);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
     static string DeviceName(IntPtr device) { uint n = 0; GetRawInputDeviceInfo(device, 0x20000007, IntPtr.Zero, ref n); if (n == 0) return ""; IntPtr p = Marshal.AllocHGlobal((int)(n + 1) * 2); try { GetRawInputDeviceInfo(device, 0x20000007, p, ref n); return Marshal.PtrToStringUni(p) ?? ""; } finally { Marshal.FreeHGlobal(p); } }
-    void Dictate() { if ((DateTime.UtcNow - last).TotalMilliseconds < 250) return; last = DateTime.UtcNow; VoiceTrace("VOICE sending Win+H"); var data = new INPUT[4]; data[0] = Key(0x5b, 0); data[1] = Key(0x48, 0); data[2] = Key(0x48, 2); data[3] = Key(0x5b, 2); uint sent = SendInput(4, data, Marshal.SizeOf(typeof(INPUT))); VoiceTrace("SendInput sent=" + sent + " error=" + Marshal.GetLastWin32Error()); }
-    static INPUT Key(ushort code, uint flags) { return new INPUT { type = 1, u = new UNION { k = new KEY { vk = code, flags = flags } } }; }
+    void Dictate()
+    {
+        if ((DateTime.UtcNow - last).TotalMilliseconds < 250) return;
+        last = DateTime.UtcNow;
+        string foreground = mode == RunMode.DirectVoiceExperiment ? ForegroundProcessName() : "";
+        VoiceTrace("VOICE sending Win+H");
+        var data = new INPUT[4]; data[0] = Key(0x5b, 0); data[1] = Key(0x48, 0); data[2] = Key(0x48, 2); data[3] = Key(0x5b, 2);
+        uint sent = SendInput(4, data, Marshal.SizeOf(typeof(INPUT)));
+        int error = Marshal.GetLastWin32Error();
+        VoiceTrace("SendInput sent=" + sent + " error=" + error);
+        if (mode == RunMode.DirectVoiceExperiment)
+        {
+            relayRecognized++;
+            if (sent == 4) relayForwarded++;
+            else SendInput(2, new[] { Key(0x48, 2), Key(0x5b, 2) }, Marshal.SizeOf(typeof(INPUT)));
+            relayStatus.Text = "触发：" + relayRecognized + " 次    完整提交 Win+H：" + relayForwarded + " 次\r\n最近前台：" + foreground + "；提交事件：" + sent + "/4" + (sent == 4 ? "" : "；错误：" + error) + "\r\n此结果不能证明 UU 已将按键传到远端。";
+        }
+    }
+    static INPUT Key(ushort code, uint flags) { return new INPUT { type = 1, u = new UNION { k = new KEY { vk = code, flags = flags, extra = new UIntPtr(0x54315642) } } }; }
     protected override void WndProc(ref Message m)
     {
         if (voiceDiagnostic && m.Msg == 0x319) VoiceTrace("APPCOMMAND code=" + ((m.LParam.ToInt64() >> 16) & 0x0fff));
@@ -288,8 +349,8 @@ class Bridge : Form
             // The relay never starts local dictation, including when its status window has focus.
             if (mode == RunMode.VoiceRelay) { base.WndProc(ref m); return; }
             if (command == 43) { Dictate(); m.Result = new IntPtr(1); return; }
-            if (command == 1) { BackPressed(); m.Result = new IntPtr(1); return; }
-            if (command == 7) { HomePressed(); m.Result = new IntPtr(1); return; }
+            if (command == 1 && IsChatForeground()) { BackPressed(); m.Result = new IntPtr(1); return; }
+            if (command == 7 && IsChatForeground()) { HomePressed(); m.Result = new IntPtr(1); return; }
         }
         if (m.Msg == 0xfe) // WM_INPUT_DEVICE_CHANGE: discard stale descriptors and held keys.
         {
@@ -329,7 +390,7 @@ class Bridge : Form
                     if (mode == RunMode.VoiceRelay) { if (device.Target) ForwardVoice(); }
                     else Dictate();
                 }
-                if (mode == RunMode.VoiceRelay) continue;
+                if (mode == RunMode.VoiceRelay || mode == RunMode.DirectVoiceExperiment) continue;
                 if (device.Target && Array.IndexOf(usages, (ushort)0x224) >= 0) BeginInvoke(new Action(BackPressed));
                 else if (device.Target && Array.IndexOf(usages, (ushort)0x223) >= 0) BeginInvoke(new Action(HomePressed));
             }
@@ -391,8 +452,8 @@ class Bridge : Form
     [StructLayout(LayoutKind.Sequential)] struct UsageAndPage { public ushort Usage, Page; }
     [DllImport("hid.dll")] static extern uint HidP_MaxUsageListLength(int reportType, ushort usagePage, IntPtr preparsed);
     [DllImport("hid.dll")] static extern int HidP_GetUsagesEx(int reportType, ushort linkCollection, [Out] UsageAndPage[] usages, ref uint count, IntPtr preparsed, byte[] report, uint reportLength);
-    void ConversationPressed() { if ((DateTime.UtcNow - lastConversation).TotalMilliseconds < 700) return; lastConversation = DateTime.UtcNow; EnterConversation(); }
-    void BackPressed() { if ((DateTime.UtcNow - lastBack).TotalMilliseconds < 700) return; lastBack = DateTime.UtcNow; OpenChat(); }
+    void ConversationPressed() { if (!IsChatForeground()) return; if ((DateTime.UtcNow - lastConversation).TotalMilliseconds < 700) return; lastConversation = DateTime.UtcNow; EnterConversation(); }
+    void BackPressed() { if (!IsChatForeground()) return; if ((DateTime.UtcNow - lastBack).TotalMilliseconds < 700) return; lastBack = DateTime.UtcNow; OpenChat(); }
     void EnterConversation()
     {
         sidebarMode = false; conversationMode = false; ThreadPool.QueueUserWorkItem(delegate
@@ -401,7 +462,7 @@ class Bridge : Form
             {
                 try
                 {
-                    var window = FindChat(); if (window == IntPtr.Zero || GetForegroundWindow() != window) { Notice("请先切到 ChatGPT，再按应用图标键浏览对话。"); return; }
+                    var window = FindForegroundChat(); if (window == IntPtr.Zero || GetForegroundWindow() != window) { Notice("请先切到 ChatGPT，再按应用图标键浏览对话。"); return; }
                     var root = AutomationElement.FromHandle(window); var bounds = root.Current.BoundingRectangle;
                     var candidates = root.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.IsScrollPatternAvailableProperty, true));
                     AutomationElement best = null; double bestScore = 0;
@@ -411,7 +472,7 @@ class Bridge : Form
                         {
                             var c = candidate.Current; var r = c.BoundingRectangle; object pattern;
                             if (c.IsOffscreen || r.IsEmpty || r.Width < bounds.Width * 0.35 || r.Height < 100 || r.Left + r.Width / 2 < bounds.Left + bounds.Width * 0.4) continue;
-                            if (!candidate.TryGetCurrentPattern(ScrollPattern.Pattern, out pattern) || !((ScrollPattern)pattern).Current.VerticallyScrollable) continue;
+                            if (!candidate.TryGetCurrentPattern(ScrollPattern.Pattern, out pattern)) continue;
                             double score = r.Width * r.Height; if (score > bestScore) { best = candidate; bestScore = score; }
                         }
                         catch (ElementNotAvailableException) { }
@@ -422,7 +483,7 @@ class Bridge : Form
                     if (GetForegroundWindow() != window) return;
                     if (focusTarget != null) focusTarget.SetFocus(); else root.SetFocus();
                     if (IsTextInput(AutomationElement.FocusedElement)) { Notice("未能将焦点移出输入框，对话浏览未启用。"); return; }
-                    conversationScroller = best; conversationWindow = window; conversationMode = true; Notice("对话浏览已启用：上下翻阅，返回键回到输入框。");
+                    conversationFocus = AutomationElement.FocusedElement; conversationScroller = best; conversationWindow = window; conversationMode = true; Notice("对话浏览已启用：上下翻阅，返回键回到输入框。");
                 }
                 catch (Exception ex) { conversationMode = false; Notice("进入对话浏览失败：" + ex.Message); }
             }
@@ -430,7 +491,6 @@ class Bridge : Form
     }
     void ScrollConversation(int direction)
     {
-        ThreadPool.QueueUserWorkItem(delegate
         {
             lock (conversationLock)
             {
@@ -443,9 +503,9 @@ class Bridge : Form
                 }
                 catch (Exception ex) { conversationMode = false; Notice("对话浏览停止：" + ex.Message); }
             }
-        });
+        }
     }
-    void HomePressed() { if ((DateTime.UtcNow - lastHome).TotalMilliseconds < 700) return; lastHome = DateTime.UtcNow; EnterSidebar(); }
+    void HomePressed() { if (!IsChatForeground()) return; if ((DateTime.UtcNow - lastHome).TotalMilliseconds < 700) return; lastHome = DateTime.UtcNow; EnterSidebar(); }
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint RegisterWindowMessage(string name);
     [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterShellHookWindow(IntPtr handle);
@@ -457,12 +517,7 @@ class Bridge : Form
         {
             try
             {
-                IntPtr handle = FindChat(); if (handle == IntPtr.Zero) { Process.Start("explorer.exe", "shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App"); for (int i = 0; i < 40 && handle == IntPtr.Zero; i++) { Thread.Sleep(250); handle = FindChat(); } }
-                if (handle == IntPtr.Zero) { Notice("未找到 ChatGPT 窗口，请先手动打开应用。"); return; }
-                ActivateChat(handle); Thread.Sleep(300);
-                // Verify the target owns the foreground before looking for its input field.
-                if (GetForegroundWindow() != handle) { Notice("窗口未能切到前台，请先点击 ChatGPT 后重试。"); return; }
-
+                IntPtr handle = FindForegroundChat(); if (handle == IntPtr.Zero) return;
                 for (int attempt = 0; attempt < 10; attempt++)
                 {
                     if (GetForegroundWindow() != handle) { Notice("聚焦已停止：当前窗口已切换。"); return; }
@@ -527,8 +582,7 @@ class Bridge : Form
             {
                 try
                 {
-                    IntPtr window = FindChat(); if (window == IntPtr.Zero) { Notice("请先用返回键打开 ChatGPT，再按主页键。"); return; }
-                    ActivateChat(window); Thread.Sleep(200); if (GetForegroundWindow() != window) { Notice("未能切到 ChatGPT，左侧导航未启用。"); return; }
+                    IntPtr window = FindForegroundChat(); if (window == IntPtr.Zero) return;
                     var items = SidebarItems(window); if (items.Count == 0) { Notice("未找到左侧可聚焦的列表项。请展开侧边栏后重试。"); return; }
                     sidebarWindow = window; sidebarIndex = 0; var focused = AutomationElement.FocusedElement;
                     int chosen = -1; for (int i = 0; i < items.Count; i++) if (IsSelectedRow(items[i])) { chosen = i; break; }
@@ -555,7 +609,6 @@ class Bridge : Form
     }
     void NavigateSidebar(int delta, bool activate)
     {
-        ThreadPool.QueueUserWorkItem(delegate
         {
             lock (sidebarLock)
             {
@@ -571,7 +624,50 @@ class Bridge : Form
                 }
                 catch (Exception ex) { sidebarMode = false; Notice("左侧导航停止：" + ex.Message); }
             }
-        });
+        }
+    }
+    void NavigateActualFocus(IntPtr window, uint key)
+    {
+        try
+        {
+            if (GetForegroundWindow() != window) return;
+            var focus = AutomationElement.FocusedElement;
+            var items = SidebarItems(window);
+            int row = -1;
+            for (int i = 0; i < items.Count; i++) if (FocusInside(items[i], focus)) { row = i; break; }
+            if (GetForegroundWindow() != window) return;
+            if (row >= 0)
+            {
+                conversationMode = false; sidebarMode = true; sidebarWindow = window; sidebarIndex = row;
+                NavigateSidebar(key == 0x26 ? -1 : key == 0x28 ? 1 : 0, key == 0x0d);
+                return;
+            }
+            sidebarMode = false;
+            if (IsTextInput(focus)) { conversationMode = false; ReplayKey(window, key); return; }
+            bool browsing = conversationMode && conversationWindow == window && conversationScroller != null && (FocusInside(conversationScroller, focus) || (conversationFocus != null && focus != null && Automation.Compare(conversationFocus, focus)));
+            if (!browsing && focus != null)
+            {
+                var root = AutomationElement.FromHandle(window); var bounds = root.Current.BoundingRectangle;
+                for (var node = focus; node != null && !Automation.Compare(node, root); node = TreeWalker.ControlViewWalker.GetParent(node))
+                {
+                    object pattern; var rect = node.Current.BoundingRectangle;
+                    if (!rect.IsEmpty && rect.Width >= bounds.Width * .35 && rect.Left + rect.Width / 2 >= bounds.Left + bounds.Width * .4 && node.TryGetCurrentPattern(ScrollPattern.Pattern, out pattern))
+                    { conversationScroller = node; conversationWindow = window; browsing = true; break; }
+                }
+            }
+            if (browsing)
+            {
+                conversationMode = true;
+                if (key == 0x0d) OpenChat(); else ScrollConversation(key == 0x26 ? -1 : 1);
+            }
+            else { conversationMode = false; ReplayKey(window, key); }
+        }
+        catch (ElementNotAvailableException) { conversationMode = false; sidebarMode = false; }
+        catch (InvalidOperationException) { conversationMode = false; sidebarMode = false; }
+    }
+    void ReplayKey(IntPtr window, uint key)
+    {
+        if (GetForegroundWindow() == window) SendInput(2, new[] { Key((ushort)key, 0), Key((ushort)key, 2) }, Marshal.SizeOf(typeof(INPUT)));
     }
     bool projectCreated;
     bool TryProjectRowNewChat(AutomationElement item, IntPtr window)

@@ -60,9 +60,11 @@ $exe = Join-Path $dist 'T1Vibe.exe'
 & $csc /nologo /platform:x64 /optimize+ /target:winexe "/out:$exe" "/resource:$hook,T1Vibe.HomeHook" $refs $source
 if ($LASTEXITCODE -ne 0) { throw 'Application build failed. Exit T1Vibe before rebuilding.' }
 if ($Test) {
-    foreach ($name in @('HookTests','ProjectLabelTests','VoiceTests')) {
+    foreach ($name in @('HookTests','ProjectLabelTests','VoiceTests','NavigationTests')) {
         $testExe = Join-Path $build "$name.exe"
-        & $csc /nologo /platform:x64 /target:exe "/main:$name" "/out:$testExe" $refs $source (Join-Path $root "tests\$name.cs")
+        $testRefs = $refs
+        if ($name -eq 'NavigationTests') { $testRefs += @('/reference:System.Xaml.dll', "/reference:$wpf\PresentationCore.dll", "/reference:$wpf\PresentationFramework.dll") }
+        & $csc /nologo /platform:x64 /target:exe "/main:$name" "/out:$testExe" $testRefs $source (Join-Path $root "tests\$name.cs")
         if ($LASTEXITCODE -ne 0) { throw "$name build failed." }
         & $testExe
         if ($LASTEXITCODE -ne 0) { throw "$name failed." }

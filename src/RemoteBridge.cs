@@ -1,8 +1,9 @@
-﻿using System;
+using System;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Diagnostics;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Windows.Automation;
 using System.Windows.Forms;
 class Bridge : Form
@@ -10,6 +11,7 @@ class Bridge : Form
     internal enum RunMode { Local, VoiceRelay, UUReceiver, DirectVoiceExperiment }
     readonly RunMode mode;
     readonly NavigationKeys navigationKeys = new NavigationKeys();
+    readonly NavigationWorker navigationWorker = new NavigationWorker();
     AutomationElement conversationFocus;
     static bool IsChatForeground() { return string.Equals(ForegroundProcessName(), "ChatGPT", StringComparison.OrdinalIgnoreCase); }
     static IntPtr FindForegroundChat() { return IsChatForeground() ? GetForegroundWindow() : IntPtr.Zero; }
@@ -29,7 +31,7 @@ class Bridge : Form
         catch (UnauthorizedAccessException) { }
     }
     readonly Dictionary<IntPtr, ConsumerDevice> consumerDevices = new Dictionary<IntPtr, ConsumerDevice>();
-    NotifyIcon tray; DateTime last = DateTime.MinValue; bool opening; IntPtr keyboardHook; HookProc hookProc; EventWaitHandle homeSignal; System.Windows.Forms.Timer homeTimer; uint shellMessage; uint nativeHomeMessage; IntPtr nativeModule, nativeHook; DateTime lastHome = DateTime.MinValue; volatile bool conversationMode; IntPtr conversationWindow; AutomationElement conversationScroller; DateTime lastConversation = DateTime.MinValue; DateTime lastBack = DateTime.MinValue; readonly object conversationLock = new object(); volatile bool sidebarMode; IntPtr sidebarWindow; int sidebarIndex = -1; int[] lastOpenedSidebarId; readonly object sidebarLock = new object();
+    NotifyIcon tray; bool opening; IntPtr keyboardHook; HookProc hookProc; EventWaitHandle homeSignal; System.Windows.Forms.Timer homeTimer; uint shellMessage; uint nativeHomeMessage; IntPtr nativeModule, nativeHook; volatile bool conversationMode; IntPtr conversationWindow; AutomationElement conversationScroller; readonly object conversationLock = new object(); volatile bool sidebarMode; IntPtr sidebarWindow; int sidebarIndex = -1; int[] lastOpenedSidebarId; readonly object sidebarLock = new object();
     [STAThread] static void Main(string[] args)
     {
         if (args.Length > 0 && args[0] == "--check-package") { Environment.Exit(CheckPackage()); return; }
@@ -95,6 +97,7 @@ class Bridge : Form
         };
         FormClosed += delegate
         {
+            navigationWorker.Dispose();
             if (relayTimer != null) { relayTimer.Stop(); relayPulse.Release(SendRelayKey); relayTimer.Dispose(); }
             if (nativeHook != IntPtr.Zero) UnhookWindowsHookEx(nativeHook);
             if (nativeModule != IntPtr.Zero) FreeLibrary(nativeModule);
@@ -258,7 +261,7 @@ class Bridge : Form
                         if (vk == 0xa6) BackPressed();
                         else if (vk == 0xac) HomePressed();
                         else if (vk == 0x5d) ConversationPressed();
-                        else NavigateActualFocus(window, vk);
+                        else navigationWorker.Post(delegate { NavigateActualFocus(window, vk); });
                     }));
                 }
                 return new IntPtr(1);
@@ -281,6 +284,25 @@ class Bridge : Form
             dispatch = chat && (first || key == 0x26 || key == 0x28);
             return true;
         }
+    }
+    // UI Automation can block while Chromium answers cross-process queries.
+    // Keep it off the message loop that owns the low-level keyboard hook,
+    // and preserve key order (including repeats) on one MTA worker.
+    internal sealed class NavigationWorker : IDisposable
+    {
+        readonly BlockingCollection<Action> pending = new BlockingCollection<Action>();
+        internal NavigationWorker()
+        {
+            var thread = new Thread(delegate()
+            {
+                foreach (var action in pending.GetConsumingEnumerable()) action();
+            });
+            thread.IsBackground = true;
+            thread.SetApartmentState(ApartmentState.MTA);
+            thread.Start();
+        }
+        internal void Post(Action action) { pending.Add(action); }
+        public void Dispose() { pending.CompleteAdding(); }
     }
     internal static bool FilterApps(uint vk, int message, ref bool down, out bool trigger)
     {
@@ -316,8 +338,6 @@ class Bridge : Form
     static string DeviceName(IntPtr device) { uint n = 0; GetRawInputDeviceInfo(device, 0x20000007, IntPtr.Zero, ref n); if (n == 0) return ""; IntPtr p = Marshal.AllocHGlobal((int)(n + 1) * 2); try { GetRawInputDeviceInfo(device, 0x20000007, p, ref n); return Marshal.PtrToStringUni(p) ?? ""; } finally { Marshal.FreeHGlobal(p); } }
     void Dictate()
     {
-        if ((DateTime.UtcNow - last).TotalMilliseconds < 250) return;
-        last = DateTime.UtcNow;
         string foreground = mode == RunMode.DirectVoiceExperiment ? ForegroundProcessName() : "";
         VoiceTrace("VOICE sending Win+H");
         var data = new INPUT[4]; data[0] = Key(0x5b, 0); data[1] = Key(0x48, 0); data[2] = Key(0x48, 2); data[3] = Key(0x5b, 2);
@@ -452,31 +472,19 @@ class Bridge : Form
     [StructLayout(LayoutKind.Sequential)] struct UsageAndPage { public ushort Usage, Page; }
     [DllImport("hid.dll")] static extern uint HidP_MaxUsageListLength(int reportType, ushort usagePage, IntPtr preparsed);
     [DllImport("hid.dll")] static extern int HidP_GetUsagesEx(int reportType, ushort linkCollection, [Out] UsageAndPage[] usages, ref uint count, IntPtr preparsed, byte[] report, uint reportLength);
-    void ConversationPressed() { if (!IsChatForeground()) return; if ((DateTime.UtcNow - lastConversation).TotalMilliseconds < 700) return; lastConversation = DateTime.UtcNow; EnterConversation(); }
-    void BackPressed() { if (!IsChatForeground()) return; if ((DateTime.UtcNow - lastBack).TotalMilliseconds < 700) return; lastBack = DateTime.UtcNow; OpenChat(); }
+    void ConversationPressed() { if (!IsChatForeground()) return; EnterConversation(); }
+    void BackPressed() { if (!IsChatForeground()) return; OpenChat(); }
     void EnterConversation()
     {
-        sidebarMode = false; conversationMode = false; ThreadPool.QueueUserWorkItem(delegate
+        sidebarMode = false; conversationMode = false; navigationWorker.Post(delegate
         {
             lock (conversationLock)
             {
                 try
                 {
                     var window = FindForegroundChat(); if (window == IntPtr.Zero || GetForegroundWindow() != window) { Notice("请先切到 ChatGPT，再按应用图标键浏览对话。"); return; }
-                    var root = AutomationElement.FromHandle(window); var bounds = root.Current.BoundingRectangle;
-                    var candidates = root.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.IsScrollPatternAvailableProperty, true));
-                    AutomationElement best = null; double bestScore = 0;
-                    foreach (AutomationElement candidate in candidates)
-                    {
-                        try
-                        {
-                            var c = candidate.Current; var r = c.BoundingRectangle; object pattern;
-                            if (c.IsOffscreen || r.IsEmpty || r.Width < bounds.Width * 0.35 || r.Height < 100 || r.Left + r.Width / 2 < bounds.Left + bounds.Width * 0.4) continue;
-                            if (!candidate.TryGetCurrentPattern(ScrollPattern.Pattern, out pattern)) continue;
-                            double score = r.Width * r.Height; if (score > bestScore) { best = candidate; bestScore = score; }
-                        }
-                        catch (ElementNotAvailableException) { }
-                    }
+                    var root = AutomationElement.FromHandle(window);
+                    AutomationElement best = FindConversationScroller(root);
                     if (best == null) { Notice("未找到可滚动的对话区域；请打开一段较长的对话后重试。"); return; }
                     AutomationElement focusTarget = best;
                     if (!best.Current.IsKeyboardFocusable) { focusTarget = null; var targets = best.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.IsKeyboardFocusableProperty, true)); foreach (AutomationElement target in targets) { if (!target.Current.IsOffscreen && !IsTextInput(target)) { focusTarget = target; break; } } }
@@ -489,6 +497,24 @@ class Bridge : Form
             }
         });
     }
+    internal static AutomationElement FindConversationScroller(AutomationElement root)
+    {
+        var bounds = root.Current.BoundingRectangle;
+        var candidates = root.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.IsScrollPatternAvailableProperty, true));
+        AutomationElement best = null; double bestScore = 0;
+        foreach (AutomationElement candidate in candidates)
+        {
+            try
+            {
+                var c = candidate.Current; var r = c.BoundingRectangle; object pattern;
+                if (c.IsOffscreen || r.IsEmpty || r.Width < bounds.Width * 0.35 || r.Height < 100 || r.Left + r.Width / 2 < bounds.Left + bounds.Width * 0.4) continue;
+                if (!candidate.TryGetCurrentPattern(ScrollPattern.Pattern, out pattern) || !((ScrollPattern)pattern).Current.VerticallyScrollable) continue;
+                double score = r.Width * r.Height; if (score > bestScore) { best = candidate; bestScore = score; }
+            }
+            catch (ElementNotAvailableException) { }
+        }
+        return best;
+    }
     void ScrollConversation(int direction)
     {
         {
@@ -497,7 +523,6 @@ class Bridge : Form
                 try
                 {
                     if (!conversationMode || GetForegroundWindow() != conversationWindow) { conversationMode = false; return; }
-                    if (IsTextInput(AutomationElement.FocusedElement)) { conversationMode = false; ushort key = direction < 0 ? (ushort)0x26 : (ushort)0x28; SendInput(2, new[] { Key(key, 0), Key(key, 2) }, Marshal.SizeOf(typeof(INPUT))); return; }
                     object pattern; if (conversationScroller == null || !conversationScroller.TryGetCurrentPattern(ScrollPattern.Pattern, out pattern)) { conversationMode = false; Notice("对话区域已变化，请重新按应用图标键。"); return; }
                     var scroll = (ScrollPattern)pattern; if (scroll.Current.VerticallyScrollable) scroll.Scroll(ScrollAmount.NoAmount, direction < 0 ? ScrollAmount.SmallDecrement : ScrollAmount.SmallIncrement);
                 }
@@ -505,7 +530,7 @@ class Bridge : Form
             }
         }
     }
-    void HomePressed() { if (!IsChatForeground()) return; if ((DateTime.UtcNow - lastHome).TotalMilliseconds < 700) return; lastHome = DateTime.UtcNow; EnterSidebar(); }
+    void HomePressed() { if (!IsChatForeground()) return; EnterSidebar(); }
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint RegisterWindowMessage(string name);
     [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterShellHookWindow(IntPtr handle);
@@ -532,7 +557,7 @@ class Bridge : Form
                         if (name.Contains("message") || name.Contains("prompt") || name.Contains("消息") || name.Contains("询问") || name.Contains("输入")) score += 10;
                         if (score > bestScore) { best = edit; bestScore = score; tie = false; } else if (score == bestScore) tie = true;
                     }
-                    if (best != null && !tie) { best.SetFocus(); Thread.Sleep(100); var focused = AutomationElement.FocusedElement; if (focused != null && Automation.Compare(best, focused)) { Notice("已聚焦输入框，可以按语音键开始听写。"); return; } }
+                    if (best != null && !tie) { best.SetFocus(); Notice("已聚焦输入框，可以按语音键开始听写。"); return; }
                     Thread.Sleep(300);
                 }
                 Notice("已打开 ChatGPT，但未能确认输入框。请点击一次输入框，再按语音键。");
@@ -576,7 +601,7 @@ class Bridge : Form
     }
     void EnterSidebar()
     {
-        conversationMode = false; ThreadPool.QueueUserWorkItem(delegate
+        conversationMode = false; navigationWorker.Post(delegate
         {
             lock (sidebarLock)
             {
@@ -607,7 +632,7 @@ class Bridge : Form
         }
         return false;
     }
-    void NavigateSidebar(int delta, bool activate)
+    void NavigateSidebar(int delta, bool activate, List<AutomationElement> items)
     {
         {
             lock (sidebarLock)
@@ -615,11 +640,8 @@ class Bridge : Form
                 try
                 {
                     if (!sidebarMode || GetForegroundWindow() != sidebarWindow) { sidebarMode = false; return; }
-                    var activeFocus = AutomationElement.FocusedElement; if (IsTextInput(activeFocus)) { sidebarMode = false; ushort key = activate ? (ushort)0x0d : delta < 0 ? (ushort)0x26 : (ushort)0x28; SendInput(2, new[] { Key(key, 0), Key(key, 2) }, Marshal.SizeOf(typeof(INPUT))); return; }
-                    var items = SidebarItems(sidebarWindow); if (items.Count == 0) { sidebarMode = false; Notice("左侧列表已变化，请重新按主页键。"); return; }
-                    var focused = AutomationElement.FocusedElement; for (int i = 0; i < items.Count; i++) if (focused != null && Automation.Compare(focused, items[i])) { sidebarIndex = i; break; }
                     sidebarIndex = Math.Max(0, Math.Min(items.Count - 1, sidebarIndex + delta)); var item = items[sidebarIndex]; item.SetFocus(); if (activate) lastOpenedSidebarId = item.GetRuntimeId();
-                    if (activate) { if (TryProjectRowNewChat(item, sidebarWindow)) { if (!projectCreated) return; sidebarMode = false; conversationMode = false; Thread.Sleep(350); if (GetForegroundWindow() == sidebarWindow) BeginInvoke(new Action(OpenChat)); return; } object pattern; if (item.TryGetCurrentPattern(InvokePattern.Pattern, out pattern)) ((InvokePattern)pattern).Invoke(); else if (item.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pattern)) ((SelectionItemPattern)pattern).Select(); else { Notice("此项不支持确认打开，请使用鼠标。"); return; } sidebarMode = false; Notice("已打开：" + item.Current.Name); }
+                    if (activate) { if (TryProjectRowNewChat(item, sidebarWindow)) { if (!projectCreated) return; sidebarMode = false; conversationMode = false; if (GetForegroundWindow() == sidebarWindow) BeginInvoke(new Action(OpenChat)); return; } object pattern; if (item.TryGetCurrentPattern(InvokePattern.Pattern, out pattern)) ((InvokePattern)pattern).Invoke(); else if (item.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pattern)) ((SelectionItemPattern)pattern).Select(); else { Notice("此项不支持确认打开，请使用鼠标。"); return; } sidebarMode = false; Notice("已打开：" + item.Current.Name); }
                     else Notice("左侧选中：" + item.Current.Name);
                 }
                 catch (Exception ex) { sidebarMode = false; Notice("左侧导航停止：" + ex.Message); }
@@ -632,6 +654,15 @@ class Bridge : Form
         {
             if (GetForegroundWindow() != window) return;
             var focus = AutomationElement.FocusedElement;
+            if (IsTextInput(focus)) { conversationMode = false; sidebarMode = false; ReplayKey(window, key); return; }
+            // Repeated conversation keys need no full sidebar scan. Check actual
+            // focus each time so a mouse focus change still takes effect at once.
+            if (conversationMode && conversationWindow == window && conversationScroller != null &&
+                ((conversationFocus != null && focus != null && Automation.Compare(conversationFocus, focus)) || FocusInside(conversationScroller, focus)))
+            {
+                if (key == 0x0d) OpenChat(); else ScrollConversation(key == 0x26 ? -1 : 1);
+                return;
+            }
             var items = SidebarItems(window);
             int row = -1;
             for (int i = 0; i < items.Count; i++) if (FocusInside(items[i], focus)) { row = i; break; }
@@ -639,19 +670,18 @@ class Bridge : Form
             if (row >= 0)
             {
                 conversationMode = false; sidebarMode = true; sidebarWindow = window; sidebarIndex = row;
-                NavigateSidebar(key == 0x26 ? -1 : key == 0x28 ? 1 : 0, key == 0x0d);
+                NavigateSidebar(key == 0x26 ? -1 : key == 0x28 ? 1 : 0, key == 0x0d, items);
                 return;
             }
             sidebarMode = false;
-            if (IsTextInput(focus)) { conversationMode = false; ReplayKey(window, key); return; }
-            bool browsing = conversationMode && conversationWindow == window && conversationScroller != null && (FocusInside(conversationScroller, focus) || (conversationFocus != null && focus != null && Automation.Compare(conversationFocus, focus)));
+            bool browsing = false;
             if (!browsing && focus != null)
             {
                 var root = AutomationElement.FromHandle(window); var bounds = root.Current.BoundingRectangle;
                 for (var node = focus; node != null && !Automation.Compare(node, root); node = TreeWalker.ControlViewWalker.GetParent(node))
                 {
                     object pattern; var rect = node.Current.BoundingRectangle;
-                    if (!rect.IsEmpty && rect.Width >= bounds.Width * .35 && rect.Left + rect.Width / 2 >= bounds.Left + bounds.Width * .4 && node.TryGetCurrentPattern(ScrollPattern.Pattern, out pattern))
+                    if (!rect.IsEmpty && rect.Width >= bounds.Width * .35 && rect.Left + rect.Width / 2 >= bounds.Left + bounds.Width * .4 && node.TryGetCurrentPattern(ScrollPattern.Pattern, out pattern) && ((ScrollPattern)pattern).Current.VerticallyScrollable)
                     { conversationScroller = node; conversationWindow = window; browsing = true; break; }
                 }
             }
@@ -664,6 +694,7 @@ class Bridge : Form
         }
         catch (ElementNotAvailableException) { conversationMode = false; sidebarMode = false; }
         catch (InvalidOperationException) { conversationMode = false; sidebarMode = false; }
+        catch (Exception ex) { conversationMode = false; sidebarMode = false; Notice("导航停止：" + ex.Message); }
     }
     void ReplayKey(IntPtr window, uint key)
     {
@@ -720,7 +751,7 @@ class Bridge : Form
                 if (!IsTextInput(focus) && focus != null && TryProjectRowNewChat(focus, window))
                 {
                     if (!projectCreated) return;
-                    sidebarMode = false; conversationMode = false; Thread.Sleep(350);
+                    sidebarMode = false; conversationMode = false;
                     if (GetForegroundWindow() == window) BeginInvoke(new Action(OpenChat)); return;
                 }
                 PassEnter(window);
